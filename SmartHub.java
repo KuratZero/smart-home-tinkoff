@@ -13,12 +13,13 @@ public class SmartHub {
     private static Long hubAddress;
     private static String serverURL;
     private static Timestamp time;
-    private static Devs.Clock clock;
     private static final long waitTime = 300;
+    private static final long coolDown = 100;
     private static final Map<Integer, Devs.BlankDev> srcToDev = new HashMap<>();
     private static final Map<String, Devs.BlankDev> nameToDev = new HashMap<>();
     private static final Set<Devs.Switch> switches = new HashSet<>();
     private static final Set<Devs.LampSocket> lampsSockets = new HashSet<>();
+    private static final Set<Devs.EnvSensor> envSensors = new HashSet<>();
     private static byte[] iterRequest;
 
     public static class Utils {
@@ -167,6 +168,101 @@ public class SmartHub {
             }
         }
 
+        public static class EnvSensor {
+            public static class EnvSensorBody {
+                public static class Trigger {
+                    final boolean operation;
+                    final boolean type;
+                    final int dNum;
+                    final int value;
+                    final String name;
+
+                    public Trigger(boolean operation, boolean type, int dNum, int value, String name) {
+                        this.operation = operation;
+                        this.type = type;
+                        this.dNum = dNum;
+                        this.value = value;
+                        this.name = name;
+                    }
+
+                    @Override
+                    public String toString() {
+                        return "Trigger{" +
+                                "operation=" + operation +
+                                ", type=" + type +
+                                ", dNum=" + dNum +
+                                ", value=" + value +
+                                ", name='" + name + '\'' +
+                                '}';
+                    }
+                }
+
+                final String name;
+                final boolean dTemp;
+                final boolean dHum;
+                final boolean dLight;
+                final boolean dAir;
+                final List<Trigger> triggers;
+
+                public EnvSensorBody(String name, boolean dTemp, boolean dHum, boolean dLight, boolean dAir, List<Trigger> triggers) {
+                    this.name = name;
+                    this.dTemp = dTemp;
+                    this.dHum = dHum;
+                    this.dLight = dLight;
+                    this.dAir = dAir;
+                    this.triggers = triggers;
+                }
+
+                @Override
+                public String toString() {
+                    return "EnvSensorBody{" +
+                            "dTemp=" + dTemp +
+                            ", dHum=" + dHum +
+                            ", dLight=" + dLight +
+                            ", dAir=" + dAir +
+                            ", triggers=" + triggers +
+                            '}';
+                }
+            }
+
+            public static EnvSensorBody decodeEnvSensorGeneral(byte[] body) {
+                int i = 0;
+                String name = Utils.decodeString(Arrays.copyOfRange(body, i, i + Byte.toUnsignedInt(body[i]) + 1));
+                i += Byte.toUnsignedInt(body[i]) + 1;
+                byte sensors = body[i++];
+                boolean dTemp = (sensors % 2) == 1;
+                boolean dHum = ((sensors >> 1) % 2) == 1;
+                boolean dLight = ((sensors >> 2) % 2) == 1;
+                boolean dAir = ((sensors >> 3) % 2) == 1;
+                int len = Byte.toUnsignedInt(body[i++]);
+                List<EnvSensorBody.Trigger> triggers = new ArrayList<>();
+                for (int it = 0; it < len; it++) {
+                    byte op = body[i++];
+                    boolean operation = (op % 2) == 1;
+                    boolean type = ((op >> 1) % 2) == 1;
+                    int dNum = (op >> 2) % 4;
+                    Utils.ULED128.DecodeResult result = Utils.ULED128.decodeULED128(body, i);
+                    i = result.to + 1;
+                    int value = Math.toIntExact(result.result);
+                    String devName = Utils.decodeString(Arrays.copyOfRange(body, i, i + Byte.toUnsignedInt(body[i]) + 1));
+                    i += Byte.toUnsignedInt(body[i]) + 1;
+                    triggers.add(new EnvSensorBody.Trigger(operation, type, dNum, value, devName));
+                }
+                return new EnvSensorBody(name, dTemp, dHum, dLight, dAir, triggers);
+            }
+
+            public static List<Integer> decodeEnvSensorStatus(byte[] body) {
+                List<Integer> ls = new ArrayList<>();
+                int i = 1;
+                while (i < body.length) {
+                    Utils.ULED128.DecodeResult result = Utils.ULED128.decodeULED128(body, i);
+                    ls.add(Math.toIntExact(result.result));
+                    i = result.to + 1;
+                }
+                return ls;
+            }
+        }
+
         public static class Switch {
             public static class SwitchBody {
                 final String name;
@@ -213,10 +309,6 @@ public class SmartHub {
         public static class Clock {
             public static Timestamp decodeClockTick(byte[] body) {
                 return new Timestamp(Utils.ULED128.decodeULED128(body, 0).result);
-            }
-
-            public static String decodeClockGeneral(byte[] body) {
-                return OneWayDev.decodeOneWayDevGeneral(body);
             }
         }
     }
@@ -411,9 +503,22 @@ public class SmartHub {
             }
         }
 
-        public static class Clock extends BlankDev {
-            public Clock(int src, String name) {
-                super(src, name, Paket.Payload.DevType.CLOCK);
+        public static class EnvSensor extends BlankDev {
+            FabricPakets.EnvSensor.EnvSensorBody sensorBody;
+
+            public EnvSensor(int src, String name, FabricPakets.EnvSensor.EnvSensorBody sensorBody) {
+                super(src, name, Paket.Payload.DevType.ENVSENSOR);
+                this.sensorBody = sensorBody;
+            }
+
+            @Override
+            public String toString() {
+                return "EnvSensor{" +
+                        "sensorBody=" + sensorBody +
+                        ", src=" + src +
+                        ", name='" + name + '\'' +
+                        ", devType=" + devType +
+                        '}';
             }
         }
     }
@@ -440,11 +545,9 @@ public class SmartHub {
         }
     }
 
-    public static void updateDevicesMaps(Devs.BlankDev dev, Paket.Payload.DevType devType) {
-        switch (devType) {
-            case SWITCH -> switches.add((Devs.Switch) dev);
-            case LAMP, SOCKET -> lampsSockets.add((Devs.LampSocket) dev);
-        }
+    public static <T extends Devs.BlankDev> void updateDevicesMaps(T dev, Set<T> set) {
+        set.remove(dev);
+        set.add(dev);
         srcToDev.put(dev.src, dev);
         nameToDev.put(dev.name, dev);
     }
@@ -453,40 +556,13 @@ public class SmartHub {
         iterRequest = Utils.concatByteArrays(iterRequest, request);
     }
 
-    public static void updateDevicesHere(Set<Paket> pakets) {
-        Set<Paket> removePakets = new HashSet<>();
-        for (Paket paket : pakets) {
-            Paket.Payload payload = paket.payload;
-            if (payload.cmd == Paket.Payload.Cmd.IAMHERE || payload.cmd == Paket.Payload.Cmd.WHOISHERE) {
-                if (payload.cmd == Paket.Payload.Cmd.WHOISHERE) {
-                    addRequest(FabricPakets.Hub.encodeIAmHere());
-                }
-                removePakets.add(paket);
-                switch (payload.devType) {
-                    case SWITCH -> {
-                        FabricPakets.Switch.SwitchBody body = FabricPakets.Switch.decodeSwitchGeneral(payload.cmdBody);
-                        Devs.Switch newSwitch = new Devs.Switch(payload.src, body.name, body.devs);
-                        updateDevicesMaps(newSwitch, payload.devType);
-                    }
-                    case LAMP, SOCKET -> {
-                        String name = FabricPakets.OneWayDev.decodeOneWayDevGeneral(payload.cmdBody);
-                        Devs.LampSocket newLampSocket = new Devs.LampSocket(payload.src, name, payload.devType);
-                        updateDevicesMaps(newLampSocket, payload.devType);
-                    }
-                    case CLOCK ->
-                            clock = new Devs.Clock(payload.src, FabricPakets.Clock.decodeClockGeneral(payload.cmdBody));
-                }
-            }
-        }
-        pakets.removeAll(removePakets);
-    }
-
     private static class SmartHubExceptions {
         private static class EndSessionException extends RuntimeException {
             public EndSessionException(String message) {
                 super(message);
             }
         }
+
         private static class ErrorServerException extends Error {
             public ErrorServerException(String message) {
                 super(message);
@@ -506,39 +582,43 @@ public class SmartHub {
                 .build();
         iterRequest = new byte[0];
         HttpResponse<String> response = client.send(request, HttpResponse.BodyHandlers.ofString());
-        if (response.statusCode() == 204) {
-            throw new SmartHubExceptions.EndSessionException("End of session.");
-        }
-        if (response.statusCode() != 200 && response.statusCode() != 204) {
-            throw new SmartHubExceptions.ErrorServerException("Error server, status code: " + response.statusCode());
+        switch (response.statusCode()) {
+            case 200 -> {
+            }
+            case 204 -> throw new SmartHubExceptions.EndSessionException("End of session.");
+            default -> throw new SmartHubExceptions.ErrorServerException("Error server, status code: "
+                    + response.statusCode());
         }
         return response;
     }
 
-    private static void dispatcher(Set<Paket> pakets) {
+    public static void updateDevicesHere(Set<Paket> pakets) {
         Set<Paket> removePakets = new HashSet<>();
         for (Paket paket : pakets) {
             Paket.Payload payload = paket.payload;
-            //System.out.println(payload);
-            switch (payload.devType) {
-                case SWITCH -> {
-                    if (payload.cmd == Paket.Payload.Cmd.STATUS) {
-                        removePakets.add(paket);
-                        Devs.Switch swt = (Devs.Switch) srcToDev.get(payload.src);
-                        for (String devs : swt.list) {
-                            Devs.LampSocket lampSocket = (Devs.LampSocket) nameToDev.get(devs);
-                            addRequest(
-                                    FabricPakets.OneWayDev.encodeSetStatus(
-                                            lampSocket.src,
-                                            lampSocket.devType,
-                                            FabricPakets.Switch.decodeSwitchStatus(payload.cmdBody))
-                            );
-                        }
-                    }
+            if (payload.cmd == Paket.Payload.Cmd.IAMHERE || payload.cmd == Paket.Payload.Cmd.WHOISHERE) {
+                if (payload.cmd == Paket.Payload.Cmd.WHOISHERE) {
+                    addRequest(FabricPakets.Hub.encodeIAmHere());
                 }
-                case LAMP, SOCKET -> {
-                    if (payload.cmd == Paket.Payload.Cmd.STATUS) {
-                        removePakets.add(paket);
+                removePakets.add(paket);
+                switch (payload.devType) {
+                    case SWITCH -> {
+                        FabricPakets.Switch.SwitchBody body =
+                                FabricPakets.Switch.decodeSwitchGeneral(payload.cmdBody);
+                        Devs.Switch newSwitch = new Devs.Switch(payload.src, body.name, body.devs);
+                        updateDevicesMaps(newSwitch, switches);
+                    }
+                    case LAMP, SOCKET -> {
+                        Devs.LampSocket newLampSocket = new Devs.LampSocket(
+                                payload.src, FabricPakets.OneWayDev.decodeOneWayDevGeneral(payload.cmdBody),
+                                payload.devType);
+                        updateDevicesMaps(newLampSocket, lampsSockets);
+                    }
+                    case ENVSENSOR -> {
+                        FabricPakets.EnvSensor.EnvSensorBody body =
+                                FabricPakets.EnvSensor.decodeEnvSensorGeneral(payload.cmdBody);
+                        Devs.EnvSensor envSensor = new Devs.EnvSensor(payload.src, body.name, body);
+                        updateDevicesMaps(envSensor, envSensors);
                     }
                 }
             }
@@ -546,13 +626,104 @@ public class SmartHub {
         pakets.removeAll(removePakets);
     }
 
-    public static void main(String[] args) {
-        serverURL = args[0];
-        hubAddress = Long.parseLong(args[1], 16);
-        iterRequest = new byte[0];
-        HttpResponse<String> response = null;
+    private static void dispatcher(Set<Paket> pakets) {
+        for (Paket.Payload payload : pakets.stream().map(it -> it.payload).toList()) {
+            System.out.println(payload);
+            switch (payload.devType) {
+                case ENVSENSOR -> {
+                    Devs.EnvSensor sensor = (Devs.EnvSensor) srcToDev.get(payload.src);
+                    List<Integer> values = FabricPakets.EnvSensor.decodeEnvSensorStatus(payload.cmdBody);
+                    int i = 0;
+                    if (sensor.sensorBody.dTemp) {
+                        List<FabricPakets.EnvSensor.EnvSensorBody.Trigger> triggers =
+                                sensor.sensorBody.triggers.stream().filter(it -> it.dNum == 0).toList();
+                        int value = values.get(i);
+                        for (FabricPakets.EnvSensor.EnvSensorBody.Trigger trig : triggers) {
+                            boolean yes = !trig.type ? value < trig.value : value > trig.value;
+                            if (yes) {
+                                Devs.BlankDev lampSocket = nameToDev.get(trig.name);
+                                addRequest(
+                                        FabricPakets.OneWayDev.encodeSetStatus(
+                                                lampSocket.src,
+                                                lampSocket.devType,
+                                                trig.operation ? 1 : 0)
+                                );
+                            }
+                        }
+                        i++;
+                    }
+                    if (sensor.sensorBody.dHum) {
+                        List<FabricPakets.EnvSensor.EnvSensorBody.Trigger> triggers =
+                                sensor.sensorBody.triggers.stream().filter(it -> it.dNum == 1).toList();
+                        int value = values.get(i);
+                        for (FabricPakets.EnvSensor.EnvSensorBody.Trigger trig : triggers) {
+                            boolean yes = !trig.type ? value < trig.value : value > trig.value;
+                            if (yes) {
+                                Devs.BlankDev lampSocket = nameToDev.get(trig.name);
+                                addRequest(
+                                        FabricPakets.OneWayDev.encodeSetStatus(
+                                                lampSocket.src,
+                                                lampSocket.devType,
+                                                trig.operation ? 1 : 0)
+                                );
+                            }
+                        }
+                        i++;
+                    }
+                    if (sensor.sensorBody.dLight) {
+                        List<FabricPakets.EnvSensor.EnvSensorBody.Trigger> triggers =
+                                sensor.sensorBody.triggers.stream().filter(it -> it.dNum == 2).toList();
+                        int value = values.get(i);
+                        for (FabricPakets.EnvSensor.EnvSensorBody.Trigger trig : triggers) {
+                            boolean yes = !trig.type ? value < trig.value : value > trig.value;
+                            if (yes) {
+                                Devs.BlankDev lampSocket = nameToDev.get(trig.name);
+                                addRequest(
+                                        FabricPakets.OneWayDev.encodeSetStatus(
+                                                lampSocket.src,
+                                                lampSocket.devType,
+                                                trig.operation ? 1 : 0)
+                                );
+                            }
+                        }
+                        i++;
+                    }
+                    if (sensor.sensorBody.dAir) {
+                        List<FabricPakets.EnvSensor.EnvSensorBody.Trigger> triggers =
+                                sensor.sensorBody.triggers.stream().filter(it -> it.dNum == 3).toList();
+                        int value = values.get(i);
+                        for (FabricPakets.EnvSensor.EnvSensorBody.Trigger trig : triggers) {
+                            boolean yes = !trig.type ? value < trig.value : value > trig.value;
+                            if (yes) {
+                                Devs.BlankDev lampSocket = nameToDev.get(trig.name);
+                                addRequest(
+                                        FabricPakets.OneWayDev.encodeSetStatus(
+                                                lampSocket.src,
+                                                lampSocket.devType,
+                                                trig.operation ? 1 : 0)
+                                );
+                            }
+                        }
+                    }
+                }
+                case SWITCH -> {
+                    Devs.Switch swt = (Devs.Switch) srcToDev.get(payload.src);
+                    for (String devs : swt.list) {
+                        Devs.LampSocket lampSocket = (Devs.LampSocket) nameToDev.get(devs);
+                        addRequest(
+                                FabricPakets.OneWayDev.encodeSetStatus(
+                                        lampSocket.src,
+                                        lampSocket.devType,
+                                        FabricPakets.Switch.decodeSwitchStatus(payload.cmdBody))
+                        );
+                    }
 
+                }
+            }
+        }
+    }
 
+    public static void startHub(HttpResponse<String> response) {
         addRequest(FabricPakets.Hub.encodeWhoIsHere());
         try {
             response = doRequest();
@@ -569,7 +740,9 @@ public class SmartHub {
         while (!time.after(next_exit)) {
             try {
                 response = doRequest();
-            } catch (SmartHubExceptions.ErrorServerException | IOException | InterruptedException | URISyntaxException e) {
+                Thread.sleep(coolDown);
+            } catch (SmartHubExceptions.ErrorServerException | IOException | InterruptedException |
+                     URISyntaxException e) {
                 System.exit(99);
             } catch (SmartHubExceptions.EndSessionException e) {
                 System.exit(0);
@@ -577,17 +750,32 @@ public class SmartHub {
             pakets = getSetPakets(response.body());
             updateClock(pakets);
             updateDevicesHere(pakets);
-            System.out.println("Ostatok: " + pakets + " lost time: " + (next_exit.getTime() - time.getTime()));
         }
-        for (Devs.BlankDev dev : Stream.concat(
-                switches.stream().map(it -> ((Devs.BlankDev) it)),
-                lampsSockets.stream().map(it -> ((Devs.BlankDev) it))).toList()) {
+        for (Devs.BlankDev dev :
+                Stream.concat(
+                        Stream.concat(
+                                switches.stream().map(it -> ((Devs.BlankDev) it)),
+                                lampsSockets.stream().map(it -> ((Devs.BlankDev) it))),
+                        envSensors.stream().map(it -> ((Devs.BlankDev) it))).toList()
+        ) {
             addRequest(FabricPakets.Hub.encodeGetStatus(dev.src, dev.devType));
         }
-        for (int it = 0; true; it++){
+    }
+
+    public static void main(String[] args) {
+        serverURL = args[0];
+        hubAddress = Long.parseLong(args[1], 16);
+        iterRequest = new byte[0];
+        HttpResponse<String> response = null;
+        Set<Paket> pakets;
+        startHub(response);
+
+        while (true) {
             try {
                 response = doRequest();
-            } catch (SmartHubExceptions.ErrorServerException | IOException | InterruptedException | URISyntaxException e) {
+                Thread.sleep(coolDown);
+            } catch (SmartHubExceptions.ErrorServerException | IOException | InterruptedException |
+                     URISyntaxException e) {
                 System.exit(99);
             } catch (SmartHubExceptions.EndSessionException e) {
                 System.exit(0);
@@ -596,12 +784,6 @@ public class SmartHub {
             updateClock(pakets);
             updateDevicesHere(pakets);
             dispatcher(pakets);
-            if(it % 10000 == 0) {
-                System.out.println(srcToDev);
-                System.out.println(nameToDev);
-                System.out.println(switches);
-                System.out.println(lampsSockets);
-            }
         }
 
     }
